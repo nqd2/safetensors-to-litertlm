@@ -15,3 +15,6 @@ wheels/
 
 models/
 *.log*
+
+# Generated benchmark outputs (keep prompt/config JSON files tracked)
+benchmarks/*-benchmark.json

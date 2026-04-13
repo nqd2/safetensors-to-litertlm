@@ -103,10 +103,14 @@ def main(argv: list[str] | None = None) -> None:
     emb = rp(args.embedder)
     if os.path.isfile(emb):
         builder.add_tflite_model(emb, litertlm_builder.TfLiteModelType.EMBEDDER)
+    else:
+        print(f"Embedder TFLite not found, skipping: {emb}")
 
     ple = rp(args.per_layer_embedder)
     if os.path.isfile(ple):
         builder.add_tflite_model(ple, litertlm_builder.TfLiteModelType.PER_LAYER_EMBEDDER)
+    else:
+        print(f"Per-layer embedder TFLite not found, skipping: {ple}")
 
     out = Path(args.output).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)

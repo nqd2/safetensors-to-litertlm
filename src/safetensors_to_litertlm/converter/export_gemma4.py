@@ -100,6 +100,14 @@ def _build_export_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--behavior-parity-mode",
+        action="store_true",
+        help=(
+            "Guardrail mode for behavior-fidelity experiments. Disallows OOM shortcuts "
+            "that are known to change runtime behavior (e.g. skipping per-layer export)."
+        ),
+    )
+    p.add_argument(
         "--log-file",
         default=DEFAULT_LOG_FILE,
         help=(
@@ -225,6 +233,14 @@ def _build_export_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--skip-per-layer-embedder-export",
+        action="store_true",
+        help=(
+            "Skip exporting per_layer_embedder.tflite entirely to avoid MLIR/OOM peaks. "
+            "This also disables single-token per-layer embedder mode in export."
+        ),
+    )
+    p.add_argument(
         "--skip-prefill-decode-quant",
         action="store_true",
         help=(
@@ -263,6 +279,33 @@ def _parse_export_args(raw_argv: list[str]) -> argparse.Namespace:
         )
 
     return parser.parse_args(argv)
+
+
+def _single_token_embedder_enabled(args: argparse.Namespace) -> bool:
+    return not bool(args.skip_per_layer_embedder_export)
+
+
+def _validate_behavior_parity_mode(args: argparse.Namespace) -> None:
+    if not args.behavior_parity_mode:
+        return
+    violations: list[str] = []
+    if args.skip_per_layer_embedder_export:
+        violations.append("--skip-per-layer-embedder-export")
+    if args.skip_per_layer_embedder_quant:
+        violations.append("--skip-per-layer-embedder-quant")
+    if args.skip_prefill_decode_quant:
+        violations.append("--skip-prefill-decode-quant")
+    if args.ram_poor_export:
+        violations.append("--ram-poor-export")
+    if not args.use_jinja_template:
+        violations.append("--no-use-jinja-template")
+
+    if violations:
+        joined = ", ".join(violations)
+        raise SystemExit(
+            "Behavior parity mode rejects flags that can alter refusal/style behavior: "
+            f"{joined}. Remove these flags or disable --behavior-parity-mode."
+        )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -320,6 +363,7 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(1) from e
 
         args = _parse_export_args(raw)
+        _validate_behavior_parity_mode(args)
 
         low_memory_run = bool(args.low_memory) or env_truthy(LOW_MEMORY_ENV)
         skip_per_layer_quant = (
@@ -340,7 +384,14 @@ def main(argv: list[str] | None = None) -> None:
                 f"quantization_recipe={args.quantization_recipe} "
                 f"vision_encoder_quantization_recipe={args.vision_encoder_quantization_recipe} "
                 f"skip_prefill_decode_quant={skip_prefill_decode_quant} "
-                f"skip_per_layer_embedder_quant={skip_per_layer_quant}",
+                f"skip_per_layer_embedder_quant={skip_per_layer_quant} "
+                f"skip_per_layer_embedder_export={args.skip_per_layer_embedder_export}",
+                flush=True,
+            )
+        if args.skip_per_layer_embedder_export:
+            print(
+                "Per-layer embedder export disabled: skipping per_layer_embedder.tflite generation "
+                "to reduce peak memory usage.",
                 flush=True,
             )
         prefill_lengths = _parse_prefill_lengths(args.prefill_lengths)
@@ -403,30 +454,51 @@ def main(argv: list[str] | None = None) -> None:
             finally:
                 export_lib_mod.load_model = original  # type: ignore[method-assign]
 
+        @contextlib.contextmanager
+        def _maybe_skip_per_layer_exportables(skip_per_layer_export: bool) -> Iterator[None]:
+            if not skip_per_layer_export:
+                yield
+                return
+            from litert_torch.generative.export_hf.model_ext import exportables as model_exportables
+
+            original = model_exportables.get_additional_exportables
+
+            def _without_per_layer(model_config):
+                exportables = dict(original(model_config))
+                exportables.pop("per_layer_embedder", None)
+                return exportables
+
+            model_exportables.get_additional_exportables = _without_per_layer  # type: ignore[method-assign]
+            try:
+                yield
+            finally:
+                model_exportables.get_additional_exportables = original  # type: ignore[method-assign]
+
         # Gemma 4 requires external embedder; vision=False does not auto-enable it in config.
         with _maybe_cuda_model(args.device):
-            with maybe_selective_quant_skips(
-                skip_prefill_decode_quant,
-                skip_per_layer_quant,
-            ):
-                export_mod.export(
-                    model=args.model_path,
-                    output_dir=args.output_dir,
-                    task=args.task,
-                    keep_temporary_files=args.keep_temporary_files,
-                    trust_remote_code=args.trust_remote_code,
-                    prefill_lengths=prefill_lengths,
-                    cache_length=args.cache_length,
-                    quantization_recipe=args.quantization_recipe,
-                    externalize_embedder=True,
-                    single_token_embedder=True,
-                    split_cache=False,
-                    use_jinja_template=args.use_jinja_template,
-                    bundle_litert_lm=not args.no_bundle_litert_lm,
-                    export_vision_encoder=args.export_vision_encoder,
-                    vision_encoder_quantization_recipe=args.vision_encoder_quantization_recipe,
-                    experimental_lightweight_conversion=low_memory_run,
-                )
+            with _maybe_skip_per_layer_exportables(args.skip_per_layer_embedder_export):
+                with maybe_selective_quant_skips(
+                    skip_prefill_decode_quant,
+                    skip_per_layer_quant,
+                ):
+                    export_mod.export(
+                        model=args.model_path,
+                        output_dir=args.output_dir,
+                        task=args.task,
+                        keep_temporary_files=args.keep_temporary_files,
+                        trust_remote_code=args.trust_remote_code,
+                        prefill_lengths=prefill_lengths,
+                        cache_length=args.cache_length,
+                        quantization_recipe=args.quantization_recipe,
+                        externalize_embedder=True,
+                        single_token_embedder=_single_token_embedder_enabled(args),
+                        split_cache=False,
+                        use_jinja_template=args.use_jinja_template,
+                        bundle_litert_lm=not args.no_bundle_litert_lm,
+                        export_vision_encoder=args.export_vision_encoder,
+                        vision_encoder_quantization_recipe=args.vision_encoder_quantization_recipe,
+                        experimental_lightweight_conversion=low_memory_run,
+                    )
     finally:
         if log_fp is not None:
             sys.stdout = saved_out

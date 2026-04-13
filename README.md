@@ -137,6 +137,40 @@ If quantization fails inside `model.tflite` (prefill+decode):
 
 `ai-edge-quantizer` does not expose a true “one layer at a time” mode; skipping whole subgraphs is the practical low-RAM workaround.
 
+### Behavior drift (refusal / censorship style)
+
+If exported outputs feel more censored than the source checkpoint, treat this as a parity issue and measure it explicitly.
+
+Run a quick benchmark:
+
+```bash
+uv run behavior-benchmark \
+  --litert-model ./models/litert-community/gemma-4-E2B-it-litert-lm/gemma-4-E2B-it.litertlm \
+  --prompts-file ./benchmarks/refusal_style_prompts.json \
+  --output ./benchmarks/reference-litert-benchmark.json
+```
+
+For source-vs-export structure/template drift checks:
+
+```bash
+uv run parity-diff \
+  --source-tokenizer ./models/huihui-ai/Huihui-gemma-4-E2B-it-abliterated/tokenizer.json \
+  --source-inspection ./inspections/models/litert-community/gemma-4-E2B-it-litert-lm/gemma-4-E2B-it-inspection.md \
+  --target-inspection ./inspections/out-huihui-litertlm-localsafe/model-inspection.md
+```
+
+Use `--behavior-parity-mode` during export to reject OOM shortcuts that are known to change behavior-critical structure:
+
+```bash
+uv run gemma4-export-litertlm \
+  --behavior-parity-mode \
+  --profile litert-community-int8 \
+  --model-path ./Huihui-gemma-4-E2B-it-abliterated \
+  --output-dir ./out-parity
+```
+
+This mode refuses flags like `--skip-per-layer-embedder-export` and skip-quant options because those paths can produce unrunnable bundles or drifted behavior.
+
 ## Compare bundle sizes
 
 ```bash
@@ -181,8 +215,10 @@ litert-lm run huihui-gemma4-e2b --prompt "Hi"
 | `--vision-encoder-quantization-recipe` | Vision encoder when `--export-vision-encoder` is set (default `weight_only_wi8_afp32`). |
 | `--low-memory` | Lower RAM during export (thread caps + `experimental_lightweight_conversion`; same as `GEMMA4_EXPORT_LOW_MEMORY=1`). |
 | `--skip-per-layer-embedder-quant` | Skip quantizer on `per_layer_embedder.tflite` only (avoids common OOM); subgraph stays FP32; huge `.litertlm`. Same as `GEMMA4_EXPORT_SKIP_PER_LAYER_EMBEDDER_QUANT=1`. |
+| `--skip-per-layer-embedder-export` | Skip exporting `per_layer_embedder` subgraph entirely to reduce peak memory. Not behavior-fidelity safe for parity checks. |
 | `--skip-prefill-decode-quant` | Skip quantizer on `model.tflite` (prefill+decode). Same as `GEMMA4_EXPORT_SKIP_PREFILL_DECODE_QUANT=1`. |
 | `--ram-poor-export` | Both skips above; still quantizes `embedder.tflite`. |
+| `--behavior-parity-mode` | Reject OOM shortcut flags that change behavior-critical structure when doing refusal/style parity experiments. |
 
 ## Optional: bundle after a non-bundled export
 

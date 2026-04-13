@@ -30,6 +30,8 @@ jax-cuda13 = [
 gemma4-export-litertlm = "safetensors_to_litertlm.converter.export_gemma4:main"
 litertlm-bundle = "safetensors_to_litertlm.converter.bundle_litertlm:main"
 inspector = "safetensors_to_litertlm.utils.model_inspector:main"
+behavior-benchmark = "safetensors_to_litertlm.utils.behavior_benchmark:main"
+parity-diff = "safetensors_to_litertlm.utils.parity_diff:main"
 
 [build-system]
 requires = ["hatchling"]
