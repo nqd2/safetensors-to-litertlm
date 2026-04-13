@@ -1,0 +1,42 @@
+[project]
+name = "safetensors-to-litertlm"
+version = "0.1.0"
+description = "Convert Hugging Face Gemma 4 checkpoints to .litertlm for LiteRT-LM / Edge Gallery"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "hf>=1.10.1",
+    "litert-lm==0.10.1",
+    "tensorflow>=2.21.0",
+]
+
+[project.optional-dependencies]
+# Gemma 4 hf_export lives on litert-torch main (not in PyPI 0.8.0). Install with: uv sync --extra export
+export = [
+    "litert-torch @ git+https://github.com/google-ai-edge/litert-torch.git@1572220e9baa356878edb06cb8a62be62b1e66ce",
+    "transformers>=4.50.0",
+    "accelerate>=1.0.0",
+    "protobuf>=4.25.0",
+    "pillow>=10.0.0",
+    "sentencepiece>=0.2.0",
+    "torchvision>=0.19.0",
+]
+# JAX with CUDA 13 via pip wheels (Linux x86_64 / aarch64). Use with: uv sync --extra export --extra jax-cuda13
+jax-cuda13 = [
+    "jax[cuda13]",
+]
+
+[project.scripts]
+gemma4-export-litertlm = "safetensors_to_litertlm.converter.export_gemma4:main"
+litertlm-bundle = "safetensors_to_litertlm.converter.bundle_litertlm:main"
+inspector = "safetensors_to_litertlm.utils.model_inspector:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/safetensors_to_litertlm"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

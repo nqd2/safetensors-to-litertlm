@@ -1,0 +1,16 @@
+# LLVM/JAX/TF tooling may drop raw profiles in cwd
+*.profraw
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+*out*/
+
+models/
