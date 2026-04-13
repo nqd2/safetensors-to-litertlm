@@ -1,7 +1,7 @@
 [project]
 name = "safetensors-to-litertlm"
 version = "0.1.0"
-description = "Convert Hugging Face Gemma 4 checkpoints to .litertlm for LiteRT-LM / Edge Gallery"
+description = "Convert local safetensors checkpoints to .litertlm for LiteRT-LM / Edge Gallery"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -27,6 +27,7 @@ jax-cuda13 = [
 ]
 
 [project.scripts]
+export-litertlm = "safetensors_to_litertlm.converter.export:main"
 gemma4-export-litertlm = "safetensors_to_litertlm.converter.export_gemma4:main"
 litertlm-bundle = "safetensors_to_litertlm.converter.bundle_litertlm:main"
 inspector = "safetensors_to_litertlm.utils.model_inspector:main"

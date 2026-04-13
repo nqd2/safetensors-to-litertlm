@@ -10,7 +10,7 @@ class ExportProfilesTests(unittest.TestCase):
                 "--profile",
                 "litert-community-int8",
                 "--model-path",
-                "models/huihui-ai/Huihui-gemma-4-E2B-it-abliterated",
+                "models/example-gemma4",
                 "--output-dir",
                 "out",
             ]
@@ -26,7 +26,7 @@ class ExportProfilesTests(unittest.TestCase):
                 "--profile",
                 "litert-community-int8",
                 "--model-path",
-                "models/huihui-ai/Huihui-gemma-4-E2B-it-abliterated",
+                "models/example-gemma4",
                 "--output-dir",
                 "out",
                 "--quantization-recipe",
@@ -43,7 +43,7 @@ class ExportProfilesTests(unittest.TestCase):
                 "--profile",
                 "litert-community-int8",
                 "--model-path",
-                "models/huihui-ai/Huihui-gemma-4-E2B-it-abliterated",
+                "models/example-gemma4",
                 "--output-dir",
                 "out",
             ]
@@ -61,7 +61,7 @@ class ExportProfilesTests(unittest.TestCase):
                 "litert-community-int8",
                 "--skip-per-layer-embedder-export",
                 "--model-path",
-                "models/huihui-ai/Huihui-gemma-4-E2B-it-abliterated",
+                "models/example-gemma4",
                 "--output-dir",
                 "out",
             ]
@@ -77,13 +77,19 @@ class ExportProfilesTests(unittest.TestCase):
                 "--behavior-parity-mode",
                 "--skip-per-layer-embedder-export",
                 "--model-path",
-                "models/huihui-ai/Huihui-gemma-4-E2B-it-abliterated",
+                "models/example-gemma4",
                 "--output-dir",
                 "out",
             ]
         )
         with self.assertRaises(SystemExit):
             export_gemma4._validate_behavior_parity_mode(ns)
+
+    def test_backend_registry_has_gemma4(self) -> None:
+        from safetensors_to_litertlm.converter.backends.registry import get_backend
+
+        backend = get_backend("gemma4")
+        self.assertEqual(backend.key, "gemma4")
 
 
 if __name__ == "__main__":

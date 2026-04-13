@@ -1,8 +1,9 @@
 """Re-pack a directory of exported LiteRT artifacts into ``model.litertlm``.
 
 Use this only if you ran export with ``--no-bundle-litertlm`` and need to bundle
-later. Normal flow: use ``gemma4-export-litertlm`` with bundling enabled
-(default); it calls the same ``LitertLmFileBuilder`` path inside litert-torch.
+later. Normal flow: use ``export-litertlm --backend gemma4`` with bundling
+enabled (default); it calls the same ``LitertLmFileBuilder`` path inside
+litert-torch.
 
 Paths are resolved relative to *artifact_dir* (typically the export work_dir
 left by ``--keep-temporary-files``).
