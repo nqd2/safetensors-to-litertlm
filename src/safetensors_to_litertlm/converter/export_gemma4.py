@@ -18,6 +18,7 @@ import contextlib
 import os
 import sys
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TextIO
 
@@ -67,6 +68,201 @@ class _QuantPresetAction(argparse.Action):
         setattr(namespace, self.dest, values)
         namespace.quantization_recipe = text_r
         namespace.vision_encoder_quantization_recipe = vision_r
+
+
+@dataclass(frozen=True)
+class _ExportProfile:
+    key: str
+    quantization_recipe: str
+    vision_encoder_quantization_recipe: str
+
+
+_EXPORT_PROFILES: dict[str, _ExportProfile] = {
+    "litert-community-int8": _ExportProfile(
+        key="litert-community-int8",
+        quantization_recipe="dynamic_wi8_afp32",
+        vision_encoder_quantization_recipe="weight_only_wi8_afp32",
+    )
+}
+
+
+def _build_export_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Export local Gemma 4 HF checkpoint to model.litertlm"
+    )
+    p.add_argument(
+        "--profile",
+        choices=tuple(_EXPORT_PROFILES.keys()),
+        default=None,
+        help=(
+            "Apply a reproducible export profile (sets default recipes). "
+            "Explicit flags later in argv override these defaults."
+        ),
+    )
+    p.add_argument(
+        "--log-file",
+        default=DEFAULT_LOG_FILE,
+        help=(
+            f"Append stdout/stderr to this file as well as the terminal (default: {DEFAULT_LOG_FILE}). "
+            "Opens before imports so early logs are captured."
+        ),
+    )
+    p.add_argument(
+        "--no-log-tee",
+        action="store_true",
+        help="Do not tee output to --log-file (terminal only).",
+    )
+    p.add_argument(
+        "--model-path",
+        required=True,
+        help="Directory with config.json, model.safetensors, tokenizer.json, etc.",
+    )
+    p.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory for exported artifacts (includes model.litertlm when bundling)",
+    )
+    p.add_argument(
+        "--task",
+        default="image_text_to_text",
+        choices=("image_text_to_text", "text_generation"),
+        help="Use image_text_to_text for Gemma4ForConditionalGeneration (default)",
+    )
+    p.add_argument(
+        "--prefill-lengths",
+        default="256,512",
+        help="Comma-separated prefill chunk sizes (e.g. 256,512,1024)",
+    )
+    p.add_argument(
+        "--cache-length",
+        type=int,
+        default=8192,
+        help="KV cache / max context slot size for export",
+    )
+    p.add_argument(
+        "--quant-preset",
+        choices=("int8", "int4"),
+        default=None,
+        action=_QuantPresetAction,
+        help=(
+            "Shorthand for ai-edge-quantizer recipes: int4 -> dynamic_wi4_afp32 + "
+            "weight_only_wi4_afp32; int8 -> dynamic_wi8_afp32 + weight_only_wi8_afp32. "
+            "Argv order matters: a later --quantization-recipe or "
+            "--vision-encoder-quantization-recipe overrides the preset for that field."
+        ),
+    )
+    p.add_argument(
+        "--quantization-recipe",
+        default="dynamic_wi8_afp32",
+        help=(
+            "Text stack recipe (ai_edge_quantizer.recipe), e.g. dynamic_wi8_afp32, "
+            "dynamic_wi4_afp32, weight_only_wi4_afp32"
+        ),
+    )
+    p.add_argument(
+        "--vision-encoder-quantization-recipe",
+        default="weight_only_wi8_afp32",
+        help=(
+            "Vision encoder when --export-vision-encoder is set "
+            "(e.g. weight_only_wi8_afp32, weight_only_wi4_afp32)"
+        ),
+    )
+    p.add_argument(
+        "--export-vision-encoder",
+        action="store_true",
+        help="Export vision TFLite subgraphs (requires upstream Gemma 4 vision support)",
+    )
+    p.add_argument(
+        "--no-bundle-litert-lm",
+        action="store_true",
+        help="Only emit intermediate TFLite/tokenizer; skip .litertlm packaging",
+    )
+    p.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Pass trust_remote_code=True when loading the HF model",
+    )
+    p.add_argument(
+        "--keep-temporary-files",
+        action="store_true",
+        help="Keep litert-torch work_dir contents under output-dir",
+    )
+    p.add_argument(
+        "--use-jinja-template",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Use tokenizer chat_template as jinja in LlmMetadata (default: true)",
+    )
+    p.add_argument(
+        "--device",
+        default="cpu",
+        metavar="DEVICE",
+        help=(
+            'PyTorch device for the loaded model during export, e.g. "cpu" (default), '
+            '"cuda", or "cuda:0". Experimental for CUDA: litert-torch lowering to TFLite '
+            "is still mostly CPU-bound; GPU may speed torch.export / attention on some "
+            "steps but can OOM (FP32 Gemma 4 needs substantial VRAM) or fail if the "
+            "converter expects CPU tensors. GPUs with under 20 GiB total VRAM are "
+            f"refused unless {SKIP_VRAM_CHECK_ENV}=1."
+        ),
+    )
+    p.add_argument(
+        "--low-memory",
+        action="store_true",
+        help=(
+            "Reduce RAM during export: cap BLAS/OpenMP threads, limit PyTorch thread pools, "
+            "and enable litert-torch experimental_lightweight_conversion (may affect speed "
+            f"or compatibility). Same as env {LOW_MEMORY_ENV}=1."
+        ),
+    )
+    p.add_argument(
+        "--skip-per-layer-embedder-quant",
+        action="store_true",
+        help=(
+            "Do not run ai-edge-quantizer on per_layer_embedder.tflite (often where RAM "
+            "spikes). The subgraph stays FP32; output .litertlm is much larger. Same as env "
+            f"{SKIP_PER_LAYER_QUANT_ENV}=1."
+        ),
+    )
+    p.add_argument(
+        "--skip-prefill-decode-quant",
+        action="store_true",
+        help=(
+            "Do not run ai-edge-quantizer on model.tflite (prefill+decode stack). Use when "
+            "quantization dies in numpy/min-max (RAM). Graph stays FP32; bundle huge. Same as env "
+            f"{SKIP_PREFILL_DECODE_QUANT_ENV}=1. "
+            "There is no supported layer-by-layer quant in ai-edge-quantizer."
+        ),
+    )
+    p.add_argument(
+        "--ram-poor-export",
+        action="store_true",
+        help=(
+            "Same as --skip-prefill-decode-quant --skip-per-layer-embedder-quant. "
+            "Still quantizes embedder.tflite. For lowest RAM through the quantizer."
+        ),
+    )
+    return p
+
+
+def _parse_export_args(raw_argv: list[str]) -> argparse.Namespace:
+    """Parse argv with optional profile defaults applied, preserving 'later flags win'."""
+    parser = _build_export_parser()
+    argv = list(raw_argv)
+    profile: _ExportProfile | None = None
+    if "--profile" in argv:
+        idx = argv.index("--profile")
+        if idx + 1 < len(argv):
+            profile = _EXPORT_PROFILES.get(argv[idx + 1])
+
+    if profile is not None:
+        parser.set_defaults(
+            quantization_recipe=profile.quantization_recipe,
+            vision_encoder_quantization_recipe=profile.vision_encoder_quantization_recipe,
+            profile=profile.key,
+        )
+
+    return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -123,153 +319,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             raise SystemExit(1) from e
 
-        p = argparse.ArgumentParser(
-            description="Export local Gemma 4 HF checkpoint to model.litertlm"
-        )
-        p.add_argument(
-            "--log-file",
-            default=DEFAULT_LOG_FILE,
-            help=(
-                f"Append stdout/stderr to this file as well as the terminal (default: {DEFAULT_LOG_FILE}). "
-                "Opens before imports so early logs are captured."
-            ),
-        )
-        p.add_argument(
-            "--no-log-tee",
-            action="store_true",
-            help="Do not tee output to --log-file (terminal only).",
-        )
-        p.add_argument(
-            "--model-path",
-            required=True,
-            help="Directory with config.json, model.safetensors, tokenizer.json, etc.",
-        )
-        p.add_argument(
-            "--output-dir",
-            required=True,
-            help="Directory for exported artifacts (includes model.litertlm when bundling)",
-        )
-        p.add_argument(
-            "--task",
-            default="image_text_to_text",
-            choices=("image_text_to_text", "text_generation"),
-            help="Use image_text_to_text for Gemma4ForConditionalGeneration (default)",
-        )
-        p.add_argument(
-            "--prefill-lengths",
-            default="256,512",
-            help="Comma-separated prefill chunk sizes (e.g. 256,512,1024)",
-        )
-        p.add_argument(
-            "--cache-length",
-            type=int,
-            default=8192,
-            help="KV cache / max context slot size for export",
-        )
-        p.add_argument(
-            "--quant-preset",
-            choices=("int8", "int4"),
-            default=None,
-            action=_QuantPresetAction,
-            help=(
-                "Shorthand for ai-edge-quantizer recipes: int4 -> dynamic_wi4_afp32 + "
-                "weight_only_wi4_afp32; int8 -> dynamic_wi8_afp32 + weight_only_wi8_afp32. "
-                "Argv order matters: a later --quantization-recipe or "
-                "--vision-encoder-quantization-recipe overrides the preset for that field."
-            ),
-        )
-        p.add_argument(
-            "--quantization-recipe",
-            default="dynamic_wi8_afp32",
-            help=(
-                "Text stack recipe (ai_edge_quantizer.recipe), e.g. dynamic_wi8_afp32, "
-                "dynamic_wi4_afp32, weight_only_wi4_afp32"
-            ),
-        )
-        p.add_argument(
-            "--vision-encoder-quantization-recipe",
-            default="weight_only_wi8_afp32",
-            help=(
-                "Vision encoder when --export-vision-encoder is set "
-                "(e.g. weight_only_wi8_afp32, weight_only_wi4_afp32)"
-            ),
-        )
-        p.add_argument(
-            "--export-vision-encoder",
-            action="store_true",
-            help="Export vision TFLite subgraphs (requires upstream Gemma 4 vision support)",
-        )
-        p.add_argument(
-            "--no-bundle-litert-lm",
-            action="store_true",
-            help="Only emit intermediate TFLite/tokenizer; skip .litertlm packaging",
-        )
-        p.add_argument(
-            "--trust-remote-code",
-            action="store_true",
-            help="Pass trust_remote_code=True when loading the HF model",
-        )
-        p.add_argument(
-            "--keep-temporary-files",
-            action="store_true",
-            help="Keep litert-torch work_dir contents under output-dir",
-        )
-        p.add_argument(
-            "--use-jinja-template",
-            default=True,
-            action=argparse.BooleanOptionalAction,
-            help="Use tokenizer chat_template as jinja in LlmMetadata (default: true)",
-        )
-        p.add_argument(
-            "--device",
-            default="cpu",
-            metavar="DEVICE",
-            help=(
-                'PyTorch device for the loaded model during export, e.g. "cpu" (default), '
-                '"cuda", or "cuda:0". Experimental for CUDA: litert-torch lowering to TFLite '
-                "is still mostly CPU-bound; GPU may speed torch.export / attention on some "
-                "steps but can OOM (FP32 Gemma 4 needs substantial VRAM) or fail if the "
-                "converter expects CPU tensors. GPUs with under 20 GiB total VRAM are "
-                f"refused unless {SKIP_VRAM_CHECK_ENV}=1."
-            ),
-        )
-        p.add_argument(
-            "--low-memory",
-            action="store_true",
-            help=(
-                "Reduce RAM during export: cap BLAS/OpenMP threads, limit PyTorch thread pools, "
-                "and enable litert-torch experimental_lightweight_conversion (may affect speed "
-                f"or compatibility). Same as env {LOW_MEMORY_ENV}=1."
-            ),
-        )
-        p.add_argument(
-            "--skip-per-layer-embedder-quant",
-            action="store_true",
-            help=(
-                "Do not run ai-edge-quantizer on per_layer_embedder.tflite (often where RAM "
-                "spikes). The subgraph stays FP32; output .litertlm is much larger. Same as env "
-                f"{SKIP_PER_LAYER_QUANT_ENV}=1."
-            ),
-        )
-        p.add_argument(
-            "--skip-prefill-decode-quant",
-            action="store_true",
-            help=(
-                "Do not run ai-edge-quantizer on model.tflite (prefill+decode stack). Use when "
-                "quantization dies in numpy/min-max (RAM). Graph stays FP32; bundle huge. Same as "
-                f"env {SKIP_PREFILL_DECODE_QUANT_ENV}=1. "
-                "There is no supported layer-by-layer quant in ai-edge-quantizer."
-            ),
-        )
-        p.add_argument(
-            "--ram-poor-export",
-            action="store_true",
-            help=(
-                "Same as --skip-prefill-decode-quant --skip-per-layer-embedder-quant. "
-                "Still quantizes embedder.tflite. For lowest RAM through the quantizer."
-            ),
-        )
-        args = p.parse_args(raw)
+        args = _parse_export_args(raw)
 
         low_memory_run = bool(args.low_memory) or env_truthy(LOW_MEMORY_ENV)
         skip_per_layer_quant = (
@@ -282,6 +332,17 @@ def main(argv: list[str] | None = None) -> None:
             or bool(args.skip_prefill_decode_quant)
             or env_truthy(SKIP_PREFILL_DECODE_QUANT_ENV)
         )
+        profile_key = getattr(args, "profile", None)
+        if profile_key:
+            print(
+                "[export-profile] "
+                f"profile={profile_key} "
+                f"quantization_recipe={args.quantization_recipe} "
+                f"vision_encoder_quantization_recipe={args.vision_encoder_quantization_recipe} "
+                f"skip_prefill_decode_quant={skip_prefill_decode_quant} "
+                f"skip_per_layer_embedder_quant={skip_per_layer_quant}",
+                flush=True,
+            )
         prefill_lengths = _parse_prefill_lengths(args.prefill_lengths)
 
         @contextlib.contextmanager
