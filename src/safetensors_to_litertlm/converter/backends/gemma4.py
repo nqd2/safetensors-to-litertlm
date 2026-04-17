@@ -6,9 +6,11 @@ import argparse
 import contextlib
 import os
 import sys
+import traceback
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import TextIO
 
 from safetensors_to_litertlm.utils.env import (
@@ -72,6 +74,31 @@ EXPORT_PROFILES: dict[str, ExportProfile] = {
 }
 
 
+class MultimodalIntent(str, Enum):
+    LEGACY = "legacy"
+    BEST_EFFORT = "best-effort"
+    STRICT = "strict"
+    TEXT_ONLY = "text-only"
+
+
+@dataclass(frozen=True)
+class ModelCapabilities:
+    model_type: str | None
+    architectures: tuple[str, ...]
+    has_vision_encoder: bool
+    supports_multimodal: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class ExportPlan:
+    selected_task: str
+    export_vision_encoder: bool
+    allow_fallback: bool
+    reason_code: str
+    message: str
+
+
 def build_export_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Export local Gemma 4 HF checkpoint to model.litertlm"
@@ -116,6 +143,25 @@ def build_export_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-per-layer-embedder-export", action="store_true")
     p.add_argument("--skip-prefill-decode-quant", action="store_true")
     p.add_argument("--ram-poor-export", action="store_true")
+    p.add_argument(
+        "--auto-fallback-text-only",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "When multimodal vision export fails due to known upstream incompatibility, "
+            "retry once as text_generation without exporting vision encoder."
+        ),
+    )
+    p.add_argument(
+        "--multimodal-intent",
+        choices=tuple(i.value for i in MultimodalIntent),
+        default=MultimodalIntent.LEGACY.value,
+        help=(
+            "Controls multimodal planning behavior: legacy preserves current semantics; "
+            "best-effort prefers multimodal but can downgrade; strict requires multimodal; "
+            "text-only forces text generation export."
+        ),
+    )
     return p
 
 
@@ -224,28 +270,223 @@ class Gemma4Backend:
             or env_truthy(SKIP_PREFILL_DECODE_QUANT_ENV)
         )
         prefill_lengths = _parse_prefill_lengths(args.prefill_lengths)
+        capabilities = probe_model_capabilities(args.model_path, args.trust_remote_code)
+        plan = plan_export_mode(args, capabilities)
+        print(
+            "[INFO] Export planning: "
+            f"intent={args.multimodal_intent}, model_type={capabilities.model_type}, "
+            f"supports_multimodal={capabilities.supports_multimodal}, "
+            f"selected_task={plan.selected_task}, export_vision_encoder={plan.export_vision_encoder}, "
+            f"reason_code={plan.reason_code}",
+            flush=True,
+        )
+        if plan.message:
+            print(f"[INFO] Planner detail: {plan.message}", flush=True)
+
+        effective_args = argparse.Namespace(**vars(args))
+        effective_args.task = plan.selected_task
+        effective_args.export_vision_encoder = plan.export_vision_encoder
 
         with _maybe_cuda_model(args.device):
             with _maybe_skip_per_layer_exportables(args.skip_per_layer_embedder_export):
                 with maybe_selective_quant_skips(skip_prefill_decode_quant, skip_per_layer_quant):
-                    export_mod.export(
-                        model=args.model_path,
-                        output_dir=args.output_dir,
-                        task=args.task,
-                        keep_temporary_files=args.keep_temporary_files,
-                        trust_remote_code=args.trust_remote_code,
-                        prefill_lengths=prefill_lengths,
-                        cache_length=args.cache_length,
-                        quantization_recipe=args.quantization_recipe,
-                        externalize_embedder=True,
-                        single_token_embedder=single_token_embedder_enabled(args),
-                        split_cache=False,
-                        use_jinja_template=args.use_jinja_template,
-                        bundle_litert_lm=not args.no_bundle_litert_lm,
-                        export_vision_encoder=args.export_vision_encoder,
-                        vision_encoder_quantization_recipe=args.vision_encoder_quantization_recipe,
-                        experimental_lightweight_conversion=low_memory_run,
-                    )
+                    try:
+                        _run_export(export_mod, effective_args, prefill_lengths, low_memory_run)
+                    except Exception as exc:  # pragma: no cover - fallback behavior tested via helper.
+                        fallback_args = maybe_prepare_text_only_fallback(
+                            effective_args,
+                            exc,
+                            allow_fallback=plan.allow_fallback,
+                        )
+                        if fallback_args is None:
+                            raise
+                        print(
+                            "[WARN] Vision export compatibility issue detected; "
+                            "falling back to text-only export.",
+                            flush=True,
+                        )
+                        print(
+                            f"[WARN] reason: {exc.__class__.__name__}: {exc}",
+                            flush=True,
+                        )
+                        print(
+                            "[WARN] effective fallback settings: "
+                            "task='text_generation', export_vision_encoder=False",
+                            flush=True,
+                        )
+                        _run_export(export_mod, fallback_args, prefill_lengths, low_memory_run)
+
+
+def _run_export(
+    export_mod,
+    args: argparse.Namespace,
+    prefill_lengths: list[int],
+    low_memory_run: bool,
+) -> None:
+    export_mod.export(
+        model=args.model_path,
+        output_dir=args.output_dir,
+        task=args.task,
+        keep_temporary_files=args.keep_temporary_files,
+        trust_remote_code=args.trust_remote_code,
+        prefill_lengths=prefill_lengths,
+        cache_length=args.cache_length,
+        quantization_recipe=args.quantization_recipe,
+        externalize_embedder=True,
+        single_token_embedder=single_token_embedder_enabled(args),
+        split_cache=False,
+        use_jinja_template=args.use_jinja_template,
+        bundle_litert_lm=not args.no_bundle_litert_lm,
+        export_vision_encoder=args.export_vision_encoder,
+        vision_encoder_quantization_recipe=args.vision_encoder_quantization_recipe,
+        experimental_lightweight_conversion=low_memory_run,
+    )
+
+
+def is_known_vision_export_incompatibility(exc: BaseException) -> bool:
+    message = str(exc)
+    if "vision_tower" in message and "Gemma3ForConditionalGeneration" in message:
+        return True
+    formatted = "".join(traceback.format_exception(exc))
+    return "vision_exportable.py" in formatted and "vision_tower" in formatted
+
+
+def maybe_prepare_text_only_fallback(
+    args: argparse.Namespace,
+    exc: BaseException,
+    *,
+    allow_fallback: bool | None = None,
+) -> argparse.Namespace | None:
+    is_multimodal_attempt = args.task == "image_text_to_text" and bool(args.export_vision_encoder)
+    if not is_multimodal_attempt or not is_known_vision_export_incompatibility(exc):
+        return None
+    fallback_allowed = bool(args.auto_fallback_text_only) if allow_fallback is None else bool(allow_fallback)
+    if not fallback_allowed:
+        raise SystemExit(
+            "Vision encoder export failed due to known TranslateGemma/Gemma3 incompatibility "
+            "(missing `vision_tower`). Re-run with --auto-fallback-text-only to allow automatic "
+            "text-only fallback, or disable --export-vision-encoder / use --task text_generation."
+        ) from exc
+    fallback = argparse.Namespace(**vars(args))
+    fallback.task = "text_generation"
+    fallback.export_vision_encoder = False
+    return fallback
+
+
+def _config_architectures(config) -> tuple[str, ...]:
+    architectures = getattr(config, "architectures", None) or ()
+    return tuple(str(a) for a in architectures)
+
+
+def _config_has_vision(config) -> bool:
+    if getattr(config, "vision_config", None) is not None:
+        return True
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None and getattr(text_config, "vision_config", None) is not None:
+        return True
+    for attr in ("image_token_index", "mm_tokens_per_image", "vision_soft_tokens_per_image"):
+        if hasattr(config, attr):
+            return True
+    return False
+
+
+def probe_model_capabilities(model_path: str, trust_remote_code: bool) -> ModelCapabilities:
+    try:
+        from transformers import AutoConfig
+    except ImportError:
+        return ModelCapabilities(
+            model_type=None,
+            architectures=(),
+            has_vision_encoder=False,
+            supports_multimodal=False,
+            reason="transformers unavailable for probing",
+        )
+    try:
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    except Exception as exc:
+        return ModelCapabilities(
+            model_type=None,
+            architectures=(),
+            has_vision_encoder=False,
+            supports_multimodal=False,
+            reason=f"config load failed: {exc.__class__.__name__}",
+        )
+
+    architectures = _config_architectures(config)
+    model_type = getattr(config, "model_type", None)
+    has_vision = _config_has_vision(config)
+    supports_mm = has_vision
+    reason = "vision signals detected" if supports_mm else "no vision signals in config"
+    return ModelCapabilities(
+        model_type=model_type,
+        architectures=architectures,
+        has_vision_encoder=has_vision,
+        supports_multimodal=supports_mm,
+        reason=reason,
+    )
+
+
+def plan_export_mode(args: argparse.Namespace, capabilities: ModelCapabilities) -> ExportPlan:
+    intent = MultimodalIntent(args.multimodal_intent)
+    requested_mm = args.task == "image_text_to_text" and bool(args.export_vision_encoder)
+    allow_fallback_flag = bool(args.auto_fallback_text_only)
+
+    if intent == MultimodalIntent.TEXT_ONLY:
+        return ExportPlan(
+            selected_task="text_generation",
+            export_vision_encoder=False,
+            allow_fallback=False,
+            reason_code="intent_text_only",
+            message="Explicit text-only intent requested.",
+        )
+
+    if intent == MultimodalIntent.STRICT:
+        if not capabilities.supports_multimodal:
+            raise SystemExit(
+                "Strict multimodal requested but capability probe indicates no vision support "
+                f"(model_type={capabilities.model_type}, reason={capabilities.reason})."
+            )
+        return ExportPlan(
+            selected_task="image_text_to_text",
+            export_vision_encoder=True,
+            allow_fallback=False,
+            reason_code="strict_multimodal",
+            message="Strict multimodal plan selected.",
+        )
+
+    if intent == MultimodalIntent.BEST_EFFORT:
+        if capabilities.supports_multimodal:
+            return ExportPlan(
+                selected_task="image_text_to_text",
+                export_vision_encoder=True,
+                allow_fallback=True,
+                reason_code="best_effort_multimodal",
+                message="Best-effort selected multimodal path; runtime fallback allowed.",
+            )
+        return ExportPlan(
+            selected_task="text_generation",
+            export_vision_encoder=False,
+            allow_fallback=False,
+            reason_code="best_effort_downgrade_text_only",
+            message=f"Best-effort downgraded to text-only ({capabilities.reason}).",
+        )
+
+    # Legacy behavior (default): preserve CLI semantics and existing fallback flag.
+    if requested_mm:
+        return ExportPlan(
+            selected_task="image_text_to_text",
+            export_vision_encoder=True,
+            allow_fallback=allow_fallback_flag,
+            reason_code="legacy_multimodal",
+            message="Legacy multimodal request preserved.",
+        )
+    return ExportPlan(
+        selected_task="text_generation",
+        export_vision_encoder=False,
+        allow_fallback=False,
+        reason_code="legacy_text_only",
+        message="Legacy text-only request preserved.",
+    )
 
 
 @contextlib.contextmanager
