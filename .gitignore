@@ -18,3 +18,4 @@ models/
 
 # Generated benchmark outputs (keep prompt/config JSON files tracked)
 benchmarks/*-benchmark.json
+path/to/large-file
